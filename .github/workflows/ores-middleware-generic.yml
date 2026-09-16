@@ -38,6 +38,7 @@ jobs:
 
           import (
             "context"
+            "errors"
             "reflect"
             "testing"
 
@@ -63,6 +64,17 @@ jobs:
             }
             if subject != "alice" {
               t.Fatalf("expected alice, got %q", subject)
+            }
+          }
+
+          func TestProviderPreservesConsumerErrorIdentity(t *testing.T) {
+            sentinel := errors.New("consumer-provider-failure")
+            provider := mw.ProviderFrom(func(context.Context, string) (string, error) {
+              return "", sentinel
+            })
+            _, err := provider.Verify(context.Background(), "request")
+            if err != sentinel || !errors.Is(err, sentinel) {
+              t.Fatalf("provider changed consumer error identity: %v", err)
             }
           }
 
@@ -116,8 +128,42 @@ jobs:
               t.Fatalf("order mismatch: got %#v want %#v", events, want)
             }
           }
+
+          func TestDuplicateNamesAndCancellationStayConsumerOwned(t *testing.T) {
+            events := []string{}
+            named := func(name string) mw.NamedGenericMiddleware[string, string] {
+              return mw.NamedGenericMiddleware[string, string]{
+                Name: name,
+                Middleware: func(next mw.GenericHandler[string, string]) mw.GenericHandler[string, string] {
+                  return func(ctx context.Context, request string) (string, error) {
+                    if err := ctx.Err(); err != nil {
+                      return "", err
+                    }
+                    events = append(events, name)
+                    return next(ctx, request)
+                  }
+                },
+              }
+            }
+            base := mw.GenericHandler[string, string](func(_ context.Context, request string) (string, error) {
+              return request, nil
+            })
+            composed := mw.ComposeNamedGeneric(base, named("auth"), named("auth"), named("audit"))
+            value, err := composed(context.Background(), "request")
+            if err != nil || value != "request" {
+              t.Fatalf("unexpected composed result %q %v", value, err)
+            }
+            if !reflect.DeepEqual(events, []string{"auth", "auth", "audit"}) {
+              t.Fatalf("duplicate stages changed: %#v", events)
+            }
+
+            ctx, cancel := context.WithCancel(context.Background())
+            cancel()
+            if _, err := composed(ctx, "request"); err != context.Canceled {
+              t.Fatalf("expected context.Canceled, got %v", err)
+            }
+          }
           GO
           gofmt -w generic_test.go
           go test ./...
           go list -m -json github.com/ORESoftware/ores-middleware/src/golang | tee module.json
-          grep -Fq "$ORES_MIDDLEWARE_SHA" go.sum || true
