@@ -1,0 +1,123 @@
+name: ORES middleware generic Go consumer
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ores-middleware-generic-go-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ORES_MIDDLEWARE_SHA: be15f5916efba836c875c2ba81b5e947960aa579
+
+jobs:
+  consumer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: "1.25.0"
+          cache: false
+      - name: Consume exact generic Go module revision
+        run: |
+          set -euo pipefail
+          mkdir -p target/ores-middleware-consumer
+          cd target/ores-middleware-consumer
+          go mod init example.test/ores-middleware-consumer
+          go get "github.com/ORESoftware/ores-middleware/src/golang@${ORES_MIDDLEWARE_SHA}"
+          cat > generic_test.go <<'GO'
+          package consumer
+
+          import (
+            "context"
+            "reflect"
+            "testing"
+
+            mw "github.com/ORESoftware/ores-middleware/src/golang"
+          )
+
+          type consumerSDK struct {
+            Version string
+            Prefix  string
+          }
+
+          func TestGenericProviderKeepsSDKConsumerOwned(t *testing.T) {
+            sdk := consumerSDK{Version: "v42", Prefix: "sdk-v42:"}
+            provider := mw.ProviderFrom(func(_ context.Context, token string) (string, error) {
+              if sdk.Version != "v42" {
+                t.Fatalf("unexpected SDK version %q", sdk.Version)
+              }
+              return token[len(sdk.Prefix):], nil
+            })
+            subject, err := provider.Verify(context.Background(), "sdk-v42:alice")
+            if err != nil {
+              t.Fatal(err)
+            }
+            if subject != "alice" {
+              t.Fatalf("expected alice, got %q", subject)
+            }
+          }
+
+          func TestContextAndOrderingRemainConsumerOwned(t *testing.T) {
+            contextual := mw.ContextualProviderFrom(func(_ context.Context, request string, tenant int) (string, error) {
+              return request + ":tenant-" + string(rune('0'+tenant)), nil
+            })
+            value, err := contextual.Verify(context.Background(), mw.ContextualInput[string, int]{Request: "ok", Metadata: 7})
+            if err != nil {
+              t.Fatal(err)
+            }
+            if value != "ok:tenant-7" {
+              t.Fatalf("unexpected contextual value %q", value)
+            }
+
+            events := []string{}
+            stage := func(name string) mw.GenericMiddleware[string, string] {
+              return func(next mw.GenericHandler[string, string]) mw.GenericHandler[string, string] {
+                return func(ctx context.Context, request string) (string, error) {
+                  events = append(events, name+":before")
+                  response, err := next(ctx, request)
+                  events = append(events, name+":after")
+                  return response, err
+                }
+              }
+            }
+            handler := mw.ComposeGeneric(
+              mw.GenericHandler[string, string](func(_ context.Context, request string) (string, error) {
+                return request + ":ok", nil
+              }),
+              stage("request-id"),
+              stage("consumer-auth-v42"),
+              stage("tenant-rate-limit"),
+            )
+            response, err := handler(context.Background(), "request")
+            if err != nil {
+              t.Fatal(err)
+            }
+            if response != "request:ok" {
+              t.Fatalf("unexpected response %q", response)
+            }
+            want := []string{
+              "request-id:before",
+              "consumer-auth-v42:before",
+              "tenant-rate-limit:before",
+              "tenant-rate-limit:after",
+              "consumer-auth-v42:after",
+              "request-id:after",
+            }
+            if !reflect.DeepEqual(events, want) {
+              t.Fatalf("order mismatch: got %#v want %#v", events, want)
+            }
+          }
+          GO
+          gofmt -w generic_test.go
+          go test ./...
+          go list -m -json github.com/ORESoftware/ores-middleware/src/golang | tee module.json
+          grep -Fq "$ORES_MIDDLEWARE_SHA" go.sum || true
